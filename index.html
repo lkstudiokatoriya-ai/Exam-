@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pariksha — Sign in</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="auth-shell">
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="mark">Pariksha</div>
+      <div class="tagline">Online tests, taken seriously.</div>
+    </div>
+
+    <div class="auth-toggle">
+      <button id="tabLogin" class="active" onclick="setMode('login')">Sign in</button>
+      <button id="tabSignup" onclick="setMode('signup')">Create account</button>
+    </div>
+
+    <div id="errorBox" class="auth-error" style="display:none;"></div>
+
+    <form id="authForm" onsubmit="return handleSubmit(event)">
+      <div class="field" id="nameField" style="display:none;">
+        <label for="name">Full name</label>
+        <input class="input" id="name" type="text" placeholder="As it should appear on results">
+      </div>
+      <div class="field">
+        <label for="email">Email</label>
+        <input class="input" id="email" type="email" required placeholder="you@example.com">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input class="input" id="password" type="password" required minlength="6" placeholder="At least 6 characters">
+      </div>
+
+      <button type="submit" id="submitBtn" class="btn btn-primary btn-block">Sign in</button>
+    </form>
+
+    <div style="text-align:center; margin-top: 14px;">
+      <button class="btn btn-ghost btn-sm" onclick="handleReset()">Forgot password?</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+  let mode = 'login';
+
+  function setMode(next) {
+    mode = next;
+    document.getElementById('tabLogin').classList.toggle('active', next === 'login');
+    document.getElementById('tabSignup').classList.toggle('active', next === 'signup');
+    document.getElementById('nameField').style.display = next === 'signup' ? 'block' : 'none';
+    document.getElementById('submitBtn').textContent = next === 'signup' ? 'Create account' : 'Sign in';
+    document.getElementById('errorBox').style.display = 'none';
+  }
+
+  function showError(msg) {
+    const box = document.getElementById('errorBox');
+    box.textContent = msg;
+    box.style.display = 'block';
+  }
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    const email = document.getElementById('email').value.trim();
+    const password = document.getElementById('password').value;
+    const submitBtn = document.getElementById('submitBtn');
+    submitBtn.disabled = true;
+    document.getElementById('errorBox').style.display = 'none';
+
+    try {
+      if (mode === 'signup') {
+        const name = document.getElementById('name').value.trim() || email.split('@')[0];
+        const cred = await auth.createUserWithEmailAndPassword(email, password);
+        await cred.user.updateProfile({ displayName: name });
+        await ensureUserDoc(cred.user);
+      } else {
+        await auth.signInWithEmailAndPassword(email, password);
+      }
+      await routeAfterLogin();
+    } catch (err) {
+      showError(friendlyAuthError(err));
+      submitBtn.disabled = false;
+    }
+    return false;
+  }
+
+  async function handleReset() {
+    const email = document.getElementById('email').value.trim();
+    if (!email) { showError('Enter your email above first, then tap "Forgot password?"'); return; }
+    try {
+      await auth.sendPasswordResetEmail(email);
+      showError('Password reset email sent. Check your inbox.');
+    } catch (err) {
+      showError(friendlyAuthError(err));
+    }
+  }
+
+  async function routeAfterLogin() {
+    const user = auth.currentUser;
+    const role = await ensureUserDoc(user);
+    window.location.href = role === 'admin' ? 'admin.html' : 'student.html';
+  }
+
+  // If already signed in, skip straight past the login form.
+  auth.onAuthStateChanged((user) => {
+    if (user) routeAfterLogin();
+  });
+</script>
+</body>
+</html>
