@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pariksha — Admin</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-brand">
+    <span class="mark">Pariksha</span>
+    <span class="tagline">Admin</span>
+  </div>
+  <div class="topbar-right">
+    <div class="who">
+      <span class="name" id="userName">—</span>
+      <span class="role">Administrator</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="logout()" style="color:#DCE2ED;">Sign out</button>
+  </div>
+</div>
+
+<div class="container">
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('tests')" id="tab-tests">Tests</button>
+    <button class="tab" onclick="switchTab('monitor')" id="tab-monitor">Live monitor</button>
+    <button class="tab" onclick="switchTab('results')" id="tab-results">Results</button>
+  </div>
+
+  <!-- ============ TESTS TAB ============ -->
+  <div id="view-tests">
+
+    <div id="viewTestsList">
+      <div class="panel-header">
+        <h2 style="margin:0;">Your tests</h2>
+        <button class="btn btn-primary" onclick="openCreateTestModal()">+ New test</button>
+      </div>
+      <div id="testsListBody" class="test-list">
+        <div class="loading-row"><div class="spinner"></div> Loading…</div>
+      </div>
+    </div>
+
+    <div id="viewQuestionEditor" style="display:none;">
+      <button class="btn btn-ghost btn-sm" onclick="backToTestsList()" style="margin-bottom:10px; padding-left:0;">&larr; Back to tests</button>
+      <div class="panel-header">
+        <div>
+          <h2 id="editorTestTitle" style="margin:0;">—</h2>
+          <div class="meta" style="color:var(--text-muted); font-size:13px;" id="editorTestMeta"></div>
+        </div>
+        <button class="btn btn-primary" id="publishBtn" onclick="togglePublish()">Publish</button>
+      </div>
+
+      <div class="card" style="margin-bottom:20px;">
+        <h3 id="qFormTitle">Add a question</h3>
+        <div class="field">
+          <label>Question text</label>
+          <textarea class="textarea" id="qText" placeholder="Type the question…"></textarea>
+        </div>
+        <div class="field" id="optionsFields"></div>
+        <div class="form-row">
+          <div class="field">
+            <label>Marks</label>
+            <input class="input" type="number" id="qMarks" value="1" min="0" step="0.5">
+          </div>
+        </div>
+        <div style="display:flex; gap:10px;">
+          <button class="btn btn-primary" onclick="saveQuestion()">Add question</button>
+          <button class="btn btn-ghost" id="cancelEditBtn" style="display:none;" onclick="resetQuestionForm()">Cancel edit</button>
+        </div>
+      </div>
+
+      <h3>Questions (<span id="qCount">0</span>)</h3>
+      <div id="questionsListBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ MONITOR TAB ============ -->
+  <div id="view-monitor" style="display:none;">
+    <div class="field" style="max-width:360px;">
+      <label>Select a test to watch</label>
+      <select class="select" id="monitorTestSelect" onchange="onMonitorTestChange()"></select>
+    </div>
+    <div id="monitorBody"></div>
+  </div>
+
+  <!-- ============ RESULTS TAB ============ -->
+  <div id="view-results" style="display:none;">
+    <div class="field" style="max-width:360px;">
+      <label>Select a test</label>
+      <select class="select" id="resultsTestSelect" onchange="onResultsTestChange()"></select>
+    </div>
+    <div id="resultsBody"></div>
+  </div>
+</div>
+
+<!-- Create test modal -->
+<div id="createTestModal" class="modal-overlay" style="display:none;" onclick="if(event.target===this) closeCreateTestModal()">
+  <div class="modal">
+    <h2>New test</h2>
+    <div class="field">
+      <label>Title</label>
+      <input class="input" id="newTestTitle" placeholder="e.g. Unit 3 — Algebra">
+    </div>
+    <div class="field">
+      <label>Description (optional)</label>
+      <textarea class="textarea" id="newTestDesc" placeholder="Shown to students before they start"></textarea>
+    </div>
+    <div class="form-row">
+      <div class="field">
+        <label>Duration (minutes)</label>
+        <input class="input" type="number" id="newTestDuration" value="30" min="1">
+      </div>
+      <div class="field">
+        <label>Negative marking</label>
+        <select class="select" id="newTestNegative">
+          <option value="0">None</option>
+          <option value="0.25">25% per wrong answer</option>
+          <option value="0.33">33% per wrong answer</option>
+          <option value="0.5">50% per wrong answer</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint" style="margin: -6px 0 16px;">You can add questions right after creating the test, and publish it whenever you're ready.</p>
+    <div style="display:flex; gap:10px; justify-content:flex-end;">
+      <button class="btn btn-outline" onclick="closeCreateTestModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createTest()">Create & add questions</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+  let allTests = [];
+  let editingTestId = null;
+  let editingTestData = null;
+  let currentQuestions = [];
+  let editingQuestionId = null;
+  let unsubscribeMonitor = null;
+  let monitorRefreshTimer = null;
+  let lastMonitorDocs = [];
+
+  requireAuth((user, role) => {
+    if (role !== 'admin') { location.href = 'student.html'; return; }
+    document.getElementById('userName').textContent = user.displayName || user.email;
+    renderOptionFields();
+    loadTestsList();
+  });
+
+  /* ================= Tabs ================= */
+  function switchTab(name) {
+    ['tests', 'monitor', 'results'].forEach(t => {
+      document.getElementById('tab-' + t).classList.toggle('active', t === name);
+      document.getElementById('view-' + t).style.display = t === name ? 'block' : 'none';
+    });
+    if (name === 'monitor') { populateTestSelect('monitorTestSelect'); }
+    else { stopMonitor(); }
+    if (name === 'results') { populateTestSelect('resultsTestSelect'); }
+  }
+
+  /* ================= Tests list ================= */
+  async function loadTestsList() {
+    const body = document.getElementById('testsListBody');
+    try {
+      const snap = await db.collection('tests').get();
+      allTests = [];
+      snap.forEach(d => allTests.push({ id: d.id, ...d.data() }));
+      allTests.sort((a, b) => (b.createdAt?.toMillis?.() || 0) - (a.createdAt?.toMillis?.() || 0));
+
+      if (allTests.length === 0) {
+        body.innerHTML = `<div class="empty-state"><h3>No tests yet</h3><p>Create your first test to add questions.</p></div>`;
+        return;
+      }
+      body.innerHTML = allTests.map(t => `
+        <div class="test-row">
+          <div>
+            <h3>${escapeHtml(t.title)}</h3>
+            <div class="meta">${t.durationMinutes} min · ${t.questionCount || 0} questions
+              ${t.isPublished ? '<span class="badge badge-forest" style="margin-left:8px;">Published</span>' : '<span class="badge badge-gray" style="margin-left:8px;">Draft</span>'}
+            </div>
+          </div>
+          <button class="btn btn-outline" onclick="openQuestionEditor('${t.id}')">Manage</button>
+        </div>
+      `).join('');
+    } catch (err) {
+      console.error(err);
+      body.innerHTML = `<div class="empty-state"><h3>Could not load tests</h3><p>${escapeHtml(err.message)}</p></div>`;
+    }
+  }
+
+  function openCreateTestModal() { document.getElementById('createTestModal').style.display = 'flex'; }
+  function closeCreateTestModal() { document.getElementById('createTestModal').style.display = 'none'; }
+
+  async function createTest() {
+    const title = document.getElementById('newTestTitle').value.trim();
+    if (!title) { alert('Please give the test a title.'); return; }
+    const duration = parseInt(document.getElementById('newTestDuration').value, 10) || 30;
+    const negative = parseFloat(document.getElementById('newTestNegative').value) || 0;
+    const description = document.getElementById('newTestDesc').value.trim();
+
+    const ref = await db.collection('tests').add({
+      title, description, durationMinutes: duration,
+      negativeMarkingFraction: negative,
+      isPublished: false,
+      questionCount: 0,
+      createdBy: auth.currentUser.uid,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+
+    document.getElementById('newTestTitle').value = '';
+    document.getElementById('newTestDesc').value = '';
+    closeCreateTestModal();
+    await loadTestsList();
+    openQuestionEditor(ref.id);
+  }
+
+  /* ================= Question editor ================= */
+  async function openQuestionEditor(testId) {
+    editingTestId = testId;
+    document.getElementById('viewTestsList').style.display = 'none';
+    document.getElementById('viewQuestionEditor').style.display = 'block';
+    resetQuestionForm();
+    await refreshEditorTest();
+    await refreshQuestionsList();
+  }
+
+  function backToTestsList() {
+    document.getElementById('viewQuestionEditor').style.display = 'none';
+    document.getElementById('viewTestsList').style.display = 'block';
+    editingTestId = null;
+    loadTestsList();
+  }
+
+  async function refreshEditorTest() {
+    const snap = await db.collection('tests').doc(editingTestId).get();
+    editingTestData = snap.data();
+    document.getElementById('editorTestTitle').textContent = editingTestData.title;
+    document.getElementById('editorTestMeta').textContent =
+      `${editingTestData.durationMinutes} min · ${editingTestData.negativeMarkingFraction > 0 ? Math.round(editingTestData.negativeMarkingFraction*100) + '% negative marking' : 'no negative marking'}`;
+    const btn = document.getElementById('publishBtn');
+    if (editingTestData.isPublished) {
+      btn.textContent = 'Unpublish';
+      btn.className = 'btn btn-outline';
+    } else {
+      btn.textContent = 'Publish';
+      btn.className = 'btn btn-primary';
+    }
+  }
+
+  async function togglePublish() {
+    if (!editingTestData.isPublished && currentQuestions.length === 0) {
+      alert('Add at least one question before publishing.');
+      return;
+    }
+    await db.collection('tests').doc(editingTestId).update({ isPublished: !editingTestData.isPublished });
+    await refreshEditorTest();
+  }
+
+  function renderOptionFields(values) {
+    const wrap = document.getElementById('optionsFields');
+    const letters = ['A', 'B', 'C', 'D'];
+    wrap.innerHTML = `<label>Options — select the correct one</label>` + letters.map((l, i) => `
+      <div class="checkbox-row" style="margin-bottom:8px;">
+        <input type="radio" name="correctOption" id="correctOpt${i}" value="${i}" ${values && values.correctIndex === i ? 'checked' : ''}>
+        <input class="input" id="opt${i}" placeholder="Option ${l}" value="${values ? escapeAttr(values.options[i] || '') : ''}">
+      </div>
+    `).join('');
+  }
+
+  function resetQuestionForm() {
+    editingQuestionId = null;
+    document.getElementById('qFormTitle').textContent = 'Add a question';
+    document.getElementById('qText').value = '';
+    document.getElementById('qMarks').value = '1';
+    renderOptionFields();
+    document.querySelector('#viewQuestionEditor .btn-primary[onclick="saveQuestion()"]').textContent = 'Add question';
+    document.getElementById('cancelEditBtn').style.display = 'none';
+  }
+
+  async function saveQuestion() {
+    const text = document.getElementById('qText').value.trim();
+    const options = [0, 1, 2, 3].map(i => document.getElementById('opt' + i).value.trim());
+    const correctRadio = document.querySelector('input[name="correctOption"]:checked');
+    const marks = parseFloat(document.getElementById('qMarks').value) || 1;
+
+    if (!text || options.some(o => !o)) { alert('Please fill in the question and all four options.'); return; }
+    if (!correctRadio) { alert('Please select which option is correct.'); return; }
+    const correctIndex = parseInt(correctRadio.value, 10);
+
+    const testRef = db.collection('tests').doc(editingTestId);
+
+    if (editingQuestionId) {
+      const batch = db.batch();
+      batch.update(testRef.collection('questions').doc(editingQuestionId), { text, options, marks });
+      batch.update(testRef.collection('answerKey').doc(editingQuestionId), { correctIndex });
+      await batch.commit();
+    } else {
+      const qRef = testRef.collection('questions').doc();
+      const batch = db.batch();
+      batch.set(qRef, { text, options, marks, order: currentQuestions.length });
+      batch.set(testRef.collection('answerKey').doc(qRef.id), { correctIndex });
+      batch.update(testRef, { questionCount: firebase.firestore.FieldValue.increment(1) });
+      await batch.commit();
+    }
+
+    resetQuestionForm();
+    await refreshEditorTest();
+    await refreshQuestionsList();
+  }
+
+  async function refreshQuestionsList() {
+    const qSnap = await db.collection('tests').doc(editingTestId).collection('questions').orderBy('order').get();
+    const keySnap = await db.collection('tests').doc(editingTestId).collection('answerKey').get();
+    const key = {};
+    keySnap.forEach(d => key[d.id] = d.data().correctIndex);
+
+    currentQuestions = qSnap.docs.map(d => ({ id: d.id, ...d.data(), correctIndex: key[d.id] }));
+    document.getElementById('qCount').textContent = currentQuestions.length;
+
+    const body = document.getElementById('questionsListBody');
+    if (currentQuestions.length === 0) {
+      body.innerHTML = `<div class="empty-state"><h3>No questions yet</h3><p>Use the form above to add the first one.</p></div>`;
+      return;
+    }
+    const letters = ['A', 'B', 'C', 'D'];
+    body.innerHTML = currentQuestions.map((q, i) => `
+      <div class="question-edit-row">
+        <div class="qtext">${i + 1}. ${escapeHtml(q.text)}</div>
+        <ol type="A">
+          ${(q.options || []).map((o, oi) => `<li class="${oi === q.correctIndex ? 'correct' : ''}">${escapeHtml(o)}${oi === q.correctIndex ? ' ✓' : ''}</li>`).join('')}
+        </ol>
+        <div class="row-actions">
+          <button class="btn btn-outline btn-sm" onclick="editQuestion('${q.id}')">Edit</button>
+          <button class="btn btn-ghost btn-sm" onclick="deleteQuestion('${q.id}')" style="color:var(--crimson);">Delete</button>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  function editQuestion(qId) {
+    const q = currentQuestions.find(x => x.id === qId);
+    if (!q) return;
+    editingQuestionId = qId;
+    document.getElementById('qFormTitle').textContent = 'Edit question';
+    document.getElementById('qText').value = q.text;
+    document.getElementById('qMarks').value = q.marks || 1;
+    renderOptionFields(q);
+    document.querySelector('#viewQuestionEditor .btn-primary[onclick="saveQuestion()"]').textContent = 'Save changes';
+    document.getElementById('cancelEditBtn').style.display = 'inline-flex';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  async function deleteQuestion(qId) {
+    if (!confirm('Delete this question? This cannot be undone.')) return;
+    const testRef = db.collection('tests').doc(editingTestId);
+    const batch = db.batch();
+    batch.delete(testRef.collection('questions').doc(qId));
+    batch.delete(testRef.collection('answerKey').doc(qId));
+    batch.update(testRef, { questionCount: firebase.firestore.FieldValue.increment(-1) });
+    await batch.commit();
+    await refreshEditorTest();
+    await refreshQuestionsList();
+  }
+
+  /* ================= Shared: populate test dropdowns ================= */
+  function populateTestSelect(selectId) {
+    const sel = document.getElementById(selectId);
+    const prev = sel.value;
+    sel.innerHTML = allTests.map(t => `<option value="${t.id}">${escapeHtml(t.title)}</option>`).join('');
+    if (allTests.length === 0) {
+      sel.innerHTML = '<option value="">No tests yet</option>';
+      return;
+    }
+    if (prev && allTests.some(t => t.id === prev)) sel.value = prev;
+    if (selectId === 'monitorTestSelect') onMonitorTestChange();
+    if (selectId === 'resultsTestSelect') onResultsTestChange();
+  }
+
+  /* ================= Live monitor ================= */
+  function stopMonitor() {
+    if (unsubscribeMonitor) { unsubscribeMonitor(); unsubscribeMonitor = null; }
+    if (monitorRefreshTimer) { clearInterval(monitorRefreshTimer); monitorRefreshTimer = null; }
+  }
+
+  function onMonitorTestChange() {
+    stopMonitor();
+    const testId = document.getElementById('monitorTestSelect').value;
+    const body = document.getElementById('monitorBody');
+    if (!testId) { body.innerHTML = ''; return; }
+    const test = allTests.find(t => t.id === testId);
+    const totalQ = test?.questionCount || 0;
+
+    body.innerHTML = `<div class="loading-row"><div class="spinner"></div> Connecting…</div>`;
+
+    unsubscribeMonitor = db.collection('attempts').where('testId', '==', testId)
+      .onSnapshot(snap => {
+        lastMonitorDocs = [];
+        snap.forEach(d => lastMonitorDocs.push({ id: d.id, ...d.data() }));
+        renderMonitorTable(totalQ);
+      }, err => {
+        body.innerHTML = `<div class="empty-state"><h3>Could not connect</h3><p>${escapeHtml(err.message)}</p></div>`;
+      });
+
+    monitorRefreshTimer = setInterval(() => renderMonitorTable(totalQ), 5000);
+  }
+
+  function renderMonitorTable(totalQ) {
+    const body = document.getElementById('monitorBody');
+    const active = lastMonitorDocs.filter(a => a.status === 'in-progress');
+
+    body.innerHTML = `
+      <div class="stat-row">
+        <div class="stat-box"><div class="num"><span class="live-dot"></span> ${active.length}</div><div class="label">Currently taking the test</div></div>
+        <div class="stat-box"><div class="num">${lastMonitorDocs.length}</div><div class="label">Total attempts</div></div>
+      </div>
+      ${active.length === 0 ? `<div class="empty-state"><h3>No one is taking this test right now</h3></div>` : `
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Student</th><th>Progress</th><th>Warnings</th><th>Time elapsed</th></tr></thead>
+        <tbody>
+          ${active.map(a => {
+            const answered = a.answers ? Object.keys(a.answers).length : 0;
+            const elapsedSec = a.startedAt ? Math.floor((Date.now() - a.startedAt.toDate().getTime()) / 1000) : 0;
+            const m = Math.floor(elapsedSec / 60), s = elapsedSec % 60;
+            const vClass = a.violationCount >= 3 ? 'badge-crimson' : a.violationCount > 0 ? 'badge-seal' : 'badge-gray';
+            return `<tr>
+              <td>${escapeHtml(a.studentName || 'Student')}</td>
+              <td style="min-width:140px;">
+                <div class="progress-bar"><span style="width:${totalQ ? Math.round(answered/totalQ*100) : 0}%;"></span></div>
+                <div style="font-size:12px; color:var(--text-muted); margin-top:3px;">${answered} / ${totalQ}</div>
+              </td>
+              <td><span class="badge ${vClass}">${a.violationCount || 0}</span></td>
+              <td>${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table></div>`}
+    `;
+  }
+
+  /* ================= Results & grading ================= */
+  let resultsCache = { questions: [], key: {} };
+
+  async function onResultsTestChange() {
+    const testId = document.getElementById('resultsTestSelect').value;
+    const body = document.getElementById('resultsBody');
+    if (!testId) { body.innerHTML = ''; return; }
+    body.innerHTML = `<div class="loading-row"><div class="spinner"></div> Loading…</div>`;
+
+    const test = allTests.find(t => t.id === testId);
+    const attemptsSnap = await db.collection('attempts').where('testId', '==', testId).get();
+    const attempts = [];
+    attemptsSnap.forEach(d => { if (d.data().status !== 'in-progress') attempts.push({ id: d.id, ...d.data() }); });
+
+    const ungraded = attempts.filter(a => !a.graded).length;
+
+    const qSnap = await db.collection('tests').doc(testId).collection('questions').orderBy('order').get();
+    const keySnap = await db.collection('tests').doc(testId).collection('answerKey').get();
+    const key = {};
+    keySnap.forEach(d => key[d.id] = d.data().correctIndex);
+    resultsCache.questions = qSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    resultsCache.key = key;
+
+    attempts.sort((a, b) => (b.submittedAt?.toMillis?.() || 0) - (a.submittedAt?.toMillis?.() || 0));
+
+    body.innerHTML = `
+      ${ungraded > 0 ? `<div class="card" style="margin-bottom:16px; display:flex; align-items:center; justify-content:space-between;">
+        <span>${ungraded} submission${ungraded === 1 ? '' : 's'} awaiting grading.</span>
+        <button class="btn btn-primary btn-sm" onclick="runGrading('${testId}')">Grade now</button>
+      </div>` : ''}
+      ${attempts.length === 0 ? `<div class="empty-state"><h3>No submissions yet</h3></div>` : `
+      <div class="table-wrap"><table class="data">
+        <thead><tr><th>Student</th><th>Score</th><th>Status</th><th>Warnings</th><th></th></tr></thead>
+        <tbody>
+          ${attempts.map(a => `
+            <tr>
+              <td>${escapeHtml(a.studentName || 'Student')}</td>
+              <td>${a.graded ? `${a.score} / ${a.maxScore}` : '<span class="badge badge-gray">Pending</span>'}</td>
+              <td>${statusBadge(a.status)}</td>
+              <td><span class="badge ${a.violationCount >= 3 ? 'badge-crimson' : 'badge-gray'}">${a.violationCount || 0}</span></td>
+              <td><button class="btn btn-ghost btn-sm" onclick="toggleReview('${a.id}')">Review</button></td>
+            </tr>
+            <tr id="review-${a.id}" style="display:none;"><td colspan="5">${buildReviewHtml(a)}</td></tr>
+          `).join('')}
+        </tbody>
+      </table></div>`}
+    `;
+  }
+
+  function statusBadge(status) {
+    if (status === 'terminated') return '<span class="badge badge-crimson">Terminated</span>';
+    if (status === 'auto-submitted') return '<span class="badge badge-gray">Time expired</span>';
+    return '<span class="badge badge-forest">Submitted</span>';
+  }
+
+  function buildReviewHtml(attempt) {
+    const rows = resultsCache.questions.map((q, i) => {
+      const given = attempt.answers ? attempt.answers[q.id] : undefined;
+      const correct = resultsCache.key[q.id];
+      const isRight = given === correct;
+      const givenText = given !== undefined ? (q.options[given] || '—') : 'Not answered';
+      return `<div class="arow ${given === undefined ? '' : isRight ? 'right' : 'wrong'}">
+        <strong>${i + 1}.</strong> ${escapeHtml(q.text)} — answered: ${escapeHtml(givenText)}${given !== undefined && !isRight ? ` (correct: ${escapeHtml(q.options[correct] || '—')})` : ''}
+      </div>`;
+    }).join('');
+    return `<div class="answer-review">${rows}</div>`;
+  }
+
+  function toggleReview(attemptId) {
+    const row = document.getElementById('review-' + attemptId);
+    row.style.display = row.style.display === 'none' ? 'table-row' : 'none';
+  }
+
+  async function runGrading(testId) {
+    const testDoc = await db.collection('tests').doc(testId).get();
+    const testData = testDoc.data();
+    const negFraction = testData.negativeMarkingFraction || 0;
+
+    const keySnap = await db.collection('tests').doc(testId).collection('answerKey').get();
+    const key = {};
+    keySnap.forEach(d => key[d.id] = d.data().correctIndex);
+
+    const qSnap = await db.collection('tests').doc(testId).collection('questions').get();
+    const marksMap = {};
+    qSnap.forEach(d => marksMap[d.id] = d.data().marks || 1);
+
+    const attemptsSnap = await db.collection('attempts').where('testId', '==', testId).get();
+    const batch = db.batch();
+    let count = 0;
+
+    attemptsSnap.forEach(doc => {
+      const data = doc.data();
+      if (data.status === 'in-progress' || data.graded) return;
+      let score = 0;
+      Object.keys(key).forEach(qId => {
+        const given = data.answers ? data.answers[qId] : undefined;
+        if (given === undefined) return;
+        const marks = marksMap[qId] || 1;
+        if (given === key[qId]) score += marks;
+        else if (negFraction > 0) score -= marks * negFraction;
+      });
+      batch.update(doc.ref, { score: Math.round(score * 100) / 100, graded: true });
+      count++;
+    });
+
+    if (count > 0) await batch.commit();
+    onResultsTestChange();
+  }
+
+  /* ================= Utils ================= */
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  }
+  function escapeAttr(str) { return escapeHtml(str).replace(/"/g, '&quot;'); }
+</script>
+</body>
+</html>
