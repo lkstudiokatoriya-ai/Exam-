@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pariksha — My tests</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-brand">
+    <span class="mark">Pariksha</span>
+  </div>
+  <div class="topbar-right">
+    <div class="who">
+      <span class="name" id="userName">—</span>
+      <span class="role">Student</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="logout()" style="color:#DCE2ED;">Sign out</button>
+  </div>
+</div>
+
+<div class="container">
+  <div class="tabs">
+    <button class="tab active" id="tabAvailable" onclick="showSection('available')">Available tests</button>
+    <button class="tab" id="tabResults" onclick="showSection('results')">My results</button>
+  </div>
+
+  <div id="sectionAvailable">
+    <div id="availableList" class="test-list">
+      <div class="loading-row"><div class="spinner"></div> Loading tests…</div>
+    </div>
+  </div>
+
+  <div id="sectionResults" style="display:none;">
+    <div id="resultsList" class="test-list">
+      <div class="loading-row"><div class="spinner"></div> Loading results…</div>
+    </div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+  let currentUser = null;
+
+  requireAuth((user, role) => {
+    if (role === 'admin') { window.location.href = 'admin.html'; return; }
+    currentUser = user;
+    document.getElementById('userName').textContent = user.displayName || user.email;
+    loadAvailableTests();
+    loadMyResults();
+  });
+
+  function showSection(which) {
+    document.getElementById('tabAvailable').classList.toggle('active', which === 'available');
+    document.getElementById('tabResults').classList.toggle('active', which === 'results');
+    document.getElementById('sectionAvailable').style.display = which === 'available' ? 'block' : 'none';
+    document.getElementById('sectionResults').style.display = which === 'results' ? 'block' : 'none';
+  }
+
+  async function loadAvailableTests() {
+    const list = document.getElementById('availableList');
+    try {
+      const testsSnap = await db.collection('tests').where('isPublished', '==', true).get();
+      const myAttempts = await db.collection('attempts').where('uid', '==', currentUser.uid).get();
+      const attemptByTest = {};
+      myAttempts.forEach(d => attemptByTest[d.data().testId] = d.data());
+
+      const now = Date.now();
+      const rows = [];
+      testsSnap.forEach(doc => {
+        const t = doc.data();
+        if (t.startTime && t.startTime.toDate().getTime() > now) return;
+        if (t.endTime && t.endTime.toDate().getTime() < now) return;
+        rows.push({ id: doc.id, ...t, attempt: attemptByTest[doc.id] || null });
+      });
+
+      if (rows.length === 0) {
+        list.innerHTML = `<div class="empty-state"><h3>No tests available right now</h3><p>Check back once your instructor publishes one.</p></div>`;
+        return;
+      }
+
+      list.innerHTML = rows.map(t => {
+        let action = '';
+        if (!t.attempt) {
+          action = `<button class="btn btn-primary" onclick="location.href='test.html?testId=${t.id}'">Start test</button>`;
+        } else if (t.attempt.status === 'in-progress') {
+          action = `<button class="btn btn-primary" onclick="location.href='test.html?testId=${t.id}'">Resume</button>`;
+        } else {
+          action = `<span class="badge badge-gray">Completed</span>`;
+        }
+        return `
+          <div class="test-row">
+            <div>
+              <h3>${escapeHtml(t.title)}</h3>
+              <div class="meta">${t.durationMinutes} min · ${t.questionCount || 0} questions${t.negativeMarkingFraction > 0 ? ' · negative marking' : ''}</div>
+            </div>
+            ${action}
+          </div>`;
+      }).join('');
+    } catch (err) {
+      console.error(err);
+      list.innerHTML = `<div class="empty-state"><h3>Could not load tests</h3><p>${escapeHtml(err.message)}</p></div>`;
+    }
+  }
+
+  async function loadMyResults() {
+    const list = document.getElementById('resultsList');
+    try {
+      const snap = await db.collection('attempts').where('uid', '==', currentUser.uid).get();
+      const attempts = [];
+      snap.forEach(d => { if (d.data().status !== 'in-progress') attempts.push({ id: d.id, ...d.data() }); });
+
+      if (attempts.length === 0) {
+        list.innerHTML = `<div class="empty-state"><h3>No completed tests yet</h3><p>Your results will show up here after you submit a test.</p></div>`;
+        return;
+      }
+
+      // Fetch test titles
+      const testIds = [...new Set(attempts.map(a => a.testId))];
+      const titles = {};
+      await Promise.all(testIds.map(async id => {
+        const t = await db.collection('tests').doc(id).get();
+        titles[id] = t.exists ? t.data().title : 'Untitled test';
+      }));
+
+      attempts.sort((a, b) => (b.submittedAt?.toMillis?.() || 0) - (a.submittedAt?.toMillis?.() || 0));
+
+      list.innerHTML = attempts.map(a => {
+        let scoreBadge = '<span class="badge badge-gray">Awaiting result</span>';
+        if (a.graded) {
+          scoreBadge = `<span class="badge badge-forest">${a.score} / ${a.maxScore}</span>`;
+        }
+        const statusNote = a.status === 'terminated'
+          ? '<span class="badge badge-crimson">Ended — rule violations</span>'
+          : a.status === 'auto-submitted' ? '<span class="badge badge-gray">Time expired</span>' : '';
+        return `
+          <div class="test-row">
+            <div>
+              <h3>${escapeHtml(titles[a.testId] || 'Test')}</h3>
+              <div class="meta">Submitted ${a.submittedAt ? a.submittedAt.toDate().toLocaleString() : '—'}</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center;">${statusNote}${scoreBadge}</div>
+          </div>`;
+      }).join('');
+    } catch (err) {
+      console.error(err);
+      list.innerHTML = `<div class="empty-state"><h3>Could not load results</h3><p>${escapeHtml(err.message)}</p></div>`;
+    }
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  }
+</script>
+</body>
+</html>
