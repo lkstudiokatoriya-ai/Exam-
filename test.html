@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pariksha — Test</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Pre-test / resume gate. Fullscreen must be requested from a real click,
+     so nothing starts automatically — the student always taps a button first. -->
+<div id="gateScreen" class="exam-gate">
+  <div class="card">
+    <div class="loading-row" id="gateLoading"><div class="spinner"></div> Loading test…</div>
+    <div id="gateContent" style="display:none;"></div>
+  </div>
+</div>
+
+<!-- Active exam UI -->
+<div id="examScreen" style="display:none;">
+  <div class="exam-topbar">
+    <div class="exam-title" id="examTitle">—</div>
+    <div style="display:flex; align-items:center; gap:14px;">
+      <div class="exam-timer" id="examTimer">--:--</div>
+      <button class="btn btn-primary btn-sm" onclick="confirmSubmit()">Submit test</button>
+    </div>
+  </div>
+
+  <div class="exam-body">
+    <div class="question-card" id="questionCard"></div>
+
+    <div class="exam-palette">
+      <h3>Questions</h3>
+      <div class="palette-grid" id="paletteGrid"></div>
+      <div class="palette-legend">
+        <div><span class="dot" style="background:var(--forest);"></span>Answered</div>
+        <div><span class="dot" style="background:var(--seal);"></span>Marked for review</div>
+        <div><span class="dot" style="background:var(--crimson-bg); border:1px solid var(--crimson);"></span>Visited, unanswered</div>
+      </div>
+      <div class="violation-note">
+        Warnings: <strong id="violationCount">0</strong> / <span id="violationMax">5</span>
+        <div style="margin-top:4px;">Leaving fullscreen, switching tabs, or copy/paste attempts are logged and shown to your instructor.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="fullscreenNudge" class="fullscreen-nudge" style="display:none;">
+  <h2 style="color:#fff;">You left fullscreen</h2>
+  <p style="max-width:400px;">This has been logged as a warning. Return to fullscreen to keep taking the test.</p>
+  <button class="btn btn-primary" onclick="reenterFullscreen()">Return to fullscreen</button>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script>
+  const MAX_VIOLATIONS = 5;
+
+  const params = new URLSearchParams(location.search);
+  const testId = params.get('testId');
+
+  let currentUser, test, questions = [];
+  let attemptRef, attemptId;
+  let answers = {};
+  let visited = new Set();
+  let markedForReview = new Set();
+  let currentIndex = 0;
+  let violationCount = 0;
+  let timeLeftSeconds = 0;
+  let timerInterval = null;
+  let lastViolationAt = 0;
+  let submitting = false;
+  let antiCheatActive = false;
+
+  document.getElementById('violationMax').textContent = MAX_VIOLATIONS;
+
+  requireAuth((user, role) => {
+    if (role === 'admin') { location.href = 'admin.html'; return; }
+    if (!testId) { location.href = 'student.html'; return; }
+    currentUser = user;
+    init();
+  });
+
+  async function init() {
+    try {
+      const testSnap = await db.collection('tests').doc(testId).get();
+      if (!testSnap.exists || testSnap.data().isPublished !== true) {
+        alert('This test is not available.');
+        location.href = 'student.html';
+        return;
+      }
+      test = testSnap.data();
+
+      attemptId = `${testId}_${currentUser.uid}`;
+      attemptRef = db.collection('attempts').doc(attemptId);
+      const attemptSnap = await attemptRef.get();
+
+      const qSnap = await db.collection('tests').doc(testId).collection('questions').orderBy('order').get();
+      questions = qSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+
+      if (questions.length === 0) {
+        showGateMessage('No questions yet', 'Your instructor hasn\'t added questions to this test.');
+        return;
+      }
+
+      if (attemptSnap.exists) {
+        const data = attemptSnap.data();
+        if (data.status !== 'in-progress') {
+          showGateMessage('Already completed', 'You have already submitted this test.');
+          return;
+        }
+        answers = data.answers || {};
+        violationCount = data.violationCount || 0;
+        Object.keys(answers).forEach(qid => visited.add(qid));
+        const startedMs = data.startedAt.toDate().getTime();
+        const elapsed = Math.floor((Date.now() - startedMs) / 1000);
+        timeLeftSeconds = Math.max(0, test.durationMinutes * 60 - elapsed);
+        updateViolationBadge();
+        showResumeGate();
+      } else {
+        showInstructionsGate();
+      }
+    } catch (err) {
+      console.error(err);
+      showGateMessage('Something went wrong', err.message);
+    }
+  }
+
+  function showGateMessage(title, body) {
+    document.getElementById('gateLoading').style.display = 'none';
+    const c = document.getElementById('gateContent');
+    c.style.display = 'block';
+    c.innerHTML = `<h2>${escapeHtml(title)}</h2><p>${escapeHtml(body)}</p>
+      <button class="btn btn-outline" onclick="location.href='student.html'">Back to my tests</button>`;
+  }
+
+  function showInstructionsGate() {
+    document.getElementById('gateLoading').style.display = 'none';
+    const c = document.getElementById('gateContent');
+    c.style.display = 'block';
+    const totalMarks = questions.reduce((s, q) => s + (q.marks || 1), 0);
+    c.innerHTML = `
+      <h2>${escapeHtml(test.title)}</h2>
+      <p style="color:var(--text-muted);">${escapeHtml(test.description || '')}</p>
+      <div class="stat-row" style="margin: 18px 0;">
+        <div class="stat-box"><div class="num">${questions.length}</div><div class="label">Questions</div></div>
+        <div class="stat-box"><div class="num">${test.durationMinutes}</div><div class="label">Minutes</div></div>
+        <div class="stat-box"><div class="num">${totalMarks}</div><div class="label">Total marks</div></div>
+      </div>
+      <ul class="rules-list">
+        <li>The test opens in fullscreen and stays there. Exiting fullscreen, switching tabs, or right-click/copy attempts are logged as warnings.</li>
+        <li>${MAX_VIOLATIONS} warnings will end your test automatically.</li>
+        <li>The timer keeps running even if you close this tab, so don't leave once you start.</li>
+        ${test.negativeMarkingFraction > 0 ? `<li>Wrong answers deduct ${Math.round(test.negativeMarkingFraction * 100)}% of that question's marks.</li>` : ''}
+      </ul>
+      <button class="btn btn-primary btn-block" onclick="beginTest()">Start test</button>
+    `;
+  }
+
+  function showResumeGate() {
+    document.getElementById('gateLoading').style.display = 'none';
+    const c = document.getElementById('gateContent');
+    c.style.display = 'block';
+    const m = Math.floor(timeLeftSeconds / 60), s = timeLeftSeconds % 60;
+    c.innerHTML = `
+      <h2>${escapeHtml(test.title)}</h2>
+      <p>You have a test in progress. Time remaining: <strong>${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}</strong></p>
+      <p style="color:var(--text-muted); font-size: 13.5px;">Returning to fullscreen will be required again.</p>
+      <button class="btn btn-primary btn-block" onclick="enterActivePhase()">Resume test</button>
+    `;
+  }
+
+  async function beginTest() {
+    const maxScore = questions.reduce((s, q) => s + (q.marks || 1), 0);
+    const data = {
+      testId, uid: currentUser.uid,
+      studentName: currentUser.displayName || currentUser.email,
+      startedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      status: 'in-progress',
+      answers: {}, violations: [], violationCount: 0,
+      score: null, maxScore, graded: false
+    };
+    await attemptRef.set(data);
+    timeLeftSeconds = test.durationMinutes * 60;
+    await enterActivePhase();
+  }
+
+  async function enterActivePhase() {
+    document.getElementById('gateScreen').style.display = 'none';
+    document.getElementById('examScreen').style.display = 'block';
+    document.getElementById('examTitle').textContent = test.title;
+
+    try {
+      await document.documentElement.requestFullscreen();
+    } catch (e) {
+      // Some browsers block this without a fresh gesture — the click that
+      // called this function should count, but we don't hard-fail either way.
+    }
+
+    renderPalette();
+    renderQuestion();
+    startTimer();
+    setupAntiCheat();
+  }
+
+  /* ---------------- Rendering ---------------- */
+
+  function renderQuestion() {
+    const q = questions[currentIndex];
+    visited.add(q.id);
+    const letters = ['A', 'B', 'C', 'D'];
+    const card = document.getElementById('questionCard');
+    card.innerHTML = `
+      <div class="question-number">Question ${currentIndex + 1} of ${questions.length} · ${q.marks || 1} mark${(q.marks||1) === 1 ? '' : 's'}</div>
+      <div class="question-text">${escapeHtml(q.text)}</div>
+      <div id="optionsWrap"></div>
+      <div class="question-nav">
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-outline" ${currentIndex === 0 ? 'disabled' : ''} onclick="goTo(${currentIndex - 1})">Previous</button>
+          <button class="btn btn-outline" onclick="toggleMark()">${markedForReview.has(q.id) ? 'Unmark' : 'Mark for review'}</button>
+        </div>
+        <button class="btn btn-ink" ${currentIndex === questions.length - 1 ? 'disabled' : ''} onclick="goTo(${currentIndex + 1})">Save & Next</button>
+      </div>
+    `;
+    const wrap = document.getElementById('optionsWrap');
+    wrap.innerHTML = (q.options || []).map((opt, i) => `
+      <div class="option ${answers[q.id] === i ? 'selected' : ''}" onclick="selectAnswer('${q.id}', ${i})">
+        <span class="letter">${letters[i]}</span>
+        <span>${escapeHtml(opt)}</span>
+      </div>
+    `).join('');
+    renderPalette();
+  }
+
+  function renderPalette() {
+    const grid = document.getElementById('paletteGrid');
+    grid.innerHTML = questions.map((q, i) => {
+      let cls = 'palette-btn';
+      if (markedForReview.has(q.id)) cls += ' marked';
+      else if (answers[q.id] !== undefined) cls += ' answered';
+      else if (visited.has(q.id)) cls += ' visited';
+      if (i === currentIndex) cls += ' current';
+      return `<button class="${cls}" onclick="goTo(${i})">${i + 1}</button>`;
+    }).join('');
+  }
+
+  function goTo(i) {
+    if (i < 0 || i >= questions.length) return;
+    currentIndex = i;
+    renderQuestion();
+  }
+
+  function selectAnswer(qId, optionIndex) {
+    answers[qId] = optionIndex;
+    visited.add(qId);
+    renderQuestion();
+    attemptRef.update({ answers }).catch(err => console.error('Save failed:', err));
+  }
+
+  function toggleMark() {
+    const qId = questions[currentIndex].id;
+    if (markedForReview.has(qId)) markedForReview.delete(qId);
+    else markedForReview.add(qId);
+    renderQuestion();
+  }
+
+  /* ---------------- Timer ---------------- */
+
+  function startTimer() {
+    updateTimerDisplay();
+    timerInterval = setInterval(() => {
+      timeLeftSeconds--;
+      updateTimerDisplay();
+      if (timeLeftSeconds <= 0) {
+        clearInterval(timerInterval);
+        submitTest('auto-submitted');
+      }
+    }, 1000);
+  }
+
+  function updateTimerDisplay() {
+    const m = Math.floor(Math.max(0, timeLeftSeconds) / 60);
+    const s = Math.max(0, timeLeftSeconds) % 60;
+    const el = document.getElementById('examTimer');
+    el.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    el.classList.toggle('critical', timeLeftSeconds <= 60);
+  }
+
+  /* ---------------- Anti-cheating ---------------- */
+
+  function setupAntiCheat() {
+    antiCheatActive = true;
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    document.addEventListener('contextmenu', blockEvent);
+    document.addEventListener('copy', blockEvent);
+    document.addEventListener('cut', blockEvent);
+    document.addEventListener('paste', blockEvent);
+    document.addEventListener('keydown', onKeyDown);
+    window.addEventListener('beforeunload', onBeforeUnload);
+  }
+
+  function teardownAntiCheat() {
+    antiCheatActive = false;
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    document.removeEventListener('fullscreenchange', onFullscreenChange);
+    document.removeEventListener('contextmenu', blockEvent);
+    document.removeEventListener('copy', blockEvent);
+    document.removeEventListener('cut', blockEvent);
+    document.removeEventListener('paste', blockEvent);
+    document.removeEventListener('keydown', onKeyDown);
+    window.removeEventListener('beforeunload', onBeforeUnload);
+  }
+
+  function blockEvent(e) { e.preventDefault(); }
+
+  function onVisibilityChange() {
+    if (document.hidden && antiCheatActive) logViolation('tab-switch');
+  }
+
+  function onFullscreenChange() {
+    if (!antiCheatActive) return;
+    if (!document.fullscreenElement) {
+      logViolation('exited-fullscreen');
+      document.getElementById('fullscreenNudge').style.display = 'flex';
+    } else {
+      document.getElementById('fullscreenNudge').style.display = 'none';
+    }
+  }
+
+  async function reenterFullscreen() {
+    try { await document.documentElement.requestFullscreen(); } catch (e) {}
+  }
+
+  function onKeyDown(e) {
+    const key = e.key ? e.key.toUpperCase() : '';
+    const blockedCombo =
+      key === 'F12' ||
+      (e.ctrlKey && e.shiftKey && ['I', 'J', 'C'].includes(key)) ||
+      (e.ctrlKey && ['U', 'S', 'P'].includes(key)) ||
+      (e.metaKey && e.altKey && key === 'I');
+    if (blockedCombo) {
+      e.preventDefault();
+      logViolation('shortcut:' + key);
+    }
+  }
+
+  function onBeforeUnload(e) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+
+  async function logViolation(type) {
+    const now = Date.now();
+    if (now - lastViolationAt < 1000) return; // debounce duplicate events
+    lastViolationAt = now;
+
+    violationCount++;
+    updateViolationBadge();
+
+    try {
+      await attemptRef.update({
+        violations: firebase.firestore.FieldValue.arrayUnion({ type, at: new Date().toISOString() }),
+        violationCount: firebase.firestore.FieldValue.increment(1)
+      });
+    } catch (err) {
+      console.error('Could not log violation:', err);
+    }
+
+    if (violationCount >= MAX_VIOLATIONS) {
+      submitTest('terminated');
+    } else {
+      showToast(`Warning ${violationCount}/${MAX_VIOLATIONS}: suspicious activity detected and logged.`, true);
+    }
+  }
+
+  function updateViolationBadge() {
+    document.getElementById('violationCount').textContent = violationCount;
+  }
+
+  /* ---------------- Submit ---------------- */
+
+  function confirmSubmit() {
+    if (confirm('Submit the test now? You cannot make changes after this.')) {
+      submitTest('submitted');
+    }
+  }
+
+  async function submitTest(status) {
+    if (submitting) return;
+    submitting = true;
+    clearInterval(timerInterval);
+    teardownAntiCheat();
+    if (document.fullscreenElement) {
+      try { await document.exitFullscreen(); } catch (e) {}
+    }
+
+    try {
+      await attemptRef.update({
+        status,
+        answers,
+        submittedAt: firebase.firestore.FieldValue.serverTimestamp()
+      });
+    } catch (err) {
+      console.error('Submit failed:', err);
+      alert('Could not submit automatically — please check your connection and try again.');
+      submitting = false;
+      return;
+    }
+
+    const msg = status === 'terminated'
+      ? 'Your test was submitted automatically due to repeated rule violations.'
+      : status === 'auto-submitted'
+        ? "Time's up — your test has been submitted."
+        : 'Your test has been submitted successfully.';
+    alert(msg);
+    location.href = 'student.html';
+  }
+
+  /* ---------------- Utils ---------------- */
+
+  function showToast(msg, warn) {
+    const t = document.createElement('div');
+    t.className = 'toast' + (warn ? ' warn' : '');
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 3500);
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str ?? '';
+    return div.innerHTML;
+  }
+</script>
+</body>
+</html>
